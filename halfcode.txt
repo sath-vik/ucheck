@@ -1,0 +1,103 @@
+__all__ = ["UKAN", "KANLayer", "KANBlock", "DWConv", "DW_bn_relu", "PatchEmbed", "ConvLayer", "D_ConvLayer"]
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from kan import KANLinear
+import math
+
+class KANLayer(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., no_kan=False):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        
+        # KAN configuration
+        grid_size = 5
+        spline_order = 3
+        scale_noise = 0.1
+        scale_base = 1.0
+        scale_spline = 1.0
+        base_activation = nn.SiLU
+        grid_eps = 0.02
+        grid_range = [-1, 1]
+
+        if not no_kan:
+            self.fc1 = KANLinear(in_features, hidden_features,
+                               grid_size=grid_size, spline_order=spline_order,
+                               scale_noise=scale_noise, scale_base=scale_base,
+                               scale_spline=scale_spline, base_activation=base_activation,
+                               grid_eps=grid_eps, grid_range=grid_range)
+            self.fc2 = KANLinear(hidden_features, out_features,
+                               grid_size=grid_size, spline_order=spline_order,
+                               scale_noise=scale_noise, scale_base=scale_base,
+                               scale_spline=scale_spline, base_activation=base_activation,
+                               grid_eps=grid_eps, grid_range=grid_range)
+        else:
+            self.fc1 = nn.Linear(in_features, hidden_features)
+            self.fc2 = nn.Linear(hidden_features, out_features)
+
+        self.dwconv = DW_bn_relu(hidden_features)
+        self.drop = nn.Dropout(drop)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        x = self.fc1(x.reshape(B*N, C)).reshape(B, N, -1)
+        x = self.dwconv(x, H, W)
+        x = self.fc2(x.reshape(B*N, -1)).reshape(B, N, -1)
+        return x
+
+class KANBlock(nn.Module):
+    def __init__(self, dim, drop=0., drop_path=0., norm_layer=nn.LayerNorm, no_kan=False):
+        super().__init__()
+        self.norm2 = norm_layer(dim)
+        self.layer = KANLayer(dim, drop=drop, no_kan=no_kan)
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+
+    def forward(self, x, H, W):
+        return x + self.drop_path(self.layer(self.norm2(x), H, W))
+
+class DW_bn_relu(nn.Module):
+    def __init__(self, dim=768):
+        super().__init__()
+        self.dwconv = nn.Conv2d(dim, dim, 3, 1, 1, groups=dim)
+        self.bn = nn.BatchNorm2d(dim)
+        self.relu = nn.ReLU()
+
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        x = x.transpose(1, 2).view(B, C, H, W)
+        x = self.relu(self.bn(self.dwconv(x)))
+        return x.flatten(2).transpose(1, 2)
+
+class PatchEmbed(nn.Module):
+    def __init__(self, img_size=224, patch_size=7, stride=4, in_chans=3, embed_dim=768):
+        super().__init__()
+        self.proj = nn.Conv2d(in_chans, embed_dim, patch_size, stride, patch_size//2)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        x = self.proj(x)
+        _, _, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)
+        return self.norm(x), H, W
+
+class ConvLayer(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
