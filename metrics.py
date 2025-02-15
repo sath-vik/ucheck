@@ -4,34 +4,28 @@ import torch.nn.functional as F
 from medpy.metric.binary import jc, dc, hd, hd95, recall, specificity, precision
 
 def iou_score(output, target):
-    smooth = 1e-5
-
-    if torch.is_tensor(output):
-        output = torch.sigmoid(output).data.cpu().numpy()
-    if torch.is_tensor(target):
-        target = target.data.cpu().numpy()
-        
-    output_ = output > 0.5
-    target_ = target > 0.5
-    intersection = (output_ & target_).sum()
-    union = (output_ | target_).sum()
+    # Convert output probabilities to predicted class indices
+    output = torch.argmax(output, dim=1)  # Reduces from [B,C,H,W] to [B,H,W]
     
-    iou = (intersection + smooth) / (union + smooth)
-    dice = (2 * intersection + smooth) / (output.sum() + target.sum() + smooth)
+    # Now both output and target are [B,H,W]
+    intersection = (output & target).float().sum((1, 2))  # Intersection per sample
+    union = (output | target).float().sum((1, 2))         # Union per sample
     
-    try:
-        hd95_val = hd95(output_, target_)
-    except:
-        hd95_val = 0
-    
-    return iou, dice, hd95_val
+    iou = (intersection + 1e-6) / (union + 1e-6)  # Avoid division by zero
+    return iou.mean().item()  # Return average IoU across batch
 
 def dice_score(output, target):
-    smooth = 1e-5
-    output = torch.sigmoid(output).view(-1).data.cpu().numpy()
-    target = target.view(-1).data.cpu().numpy()
-    intersection = (output * target).sum()
-    return (2. * intersection + smooth) / (output.sum() + target.sum() + smooth)
+    output = torch.argmax(output, dim=1)
+    intersection = (output & target).float().sum((1, 2))
+    return (2. * intersection / (output.float().sum((1,2)) + target.float().sum((1,2)) + 1e-6)).mean().item()
+
+
+# def dice_score(output, target):
+#     smooth = 1e-5
+#     output = torch.sigmoid(output).view(-1).data.cpu().numpy()
+#     target = target.view(-1).data.cpu().numpy()
+#     intersection = (output * target).sum()
+#     return (2. * intersection + smooth) / (output.sum() + target.sum() + smooth)
 
 def indicators(output, target):
     if torch.is_tensor(output):

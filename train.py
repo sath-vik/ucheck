@@ -78,7 +78,7 @@ def train(config, train_loader, model, criterion, optimizer):
     avg_meters = {'loss': AverageMeter(), 'iou': AverageMeter()}
     model.train()
 
-    pbar = tqdm(total=len(train_loader))
+    pbar = tqdm(total=len(train_loader), desc="Training", unit="batch")
     for img, mask, _ in train_loader:
         inputs = img.cuda()
         targets = mask.cuda()
@@ -86,11 +86,11 @@ def train(config, train_loader, model, criterion, optimizer):
         if config['deep_supervision']:
             outputs = model(inputs)
             loss = sum(criterion(o, targets) for o in outputs) / len(outputs)
-            iou = iou_score(outputs[-1], targets)[0]
+            iou = iou_score(outputs[-1], targets)
         else:
             output = model(inputs)
             loss = criterion(output, targets)
-            iou = iou_score(output, targets)[0]
+            iou = iou_score(output, targets)
 
         optimizer.zero_grad()
         loss.backward()
@@ -99,15 +99,17 @@ def train(config, train_loader, model, criterion, optimizer):
         avg_meters['loss'].update(loss.item(), inputs.size(0))
         avg_meters['iou'].update(iou, inputs.size(0))
         
-        pbar.set_postfix(OrderedDict([
-            ('loss', avg_meters['loss'].avg),
-            ('iou', avg_meters['iou'].avg),
-        ]))
+        # Update progress bar with only relevant metrics
+        pbar.set_postfix({
+            'Loss': f"{avg_meters['loss'].avg:.4f}",
+            'IoU': f"{avg_meters['iou'].avg:.4f}"
+        })
         pbar.update(1)
     pbar.close()
     
     return OrderedDict([('loss', avg_meters['loss'].avg),
                         ('iou', avg_meters['iou'].avg)])
+
 
 def validate(config, val_loader, model, criterion):
     avg_meters = {'loss': AverageMeter(), 
@@ -116,7 +118,7 @@ def validate(config, val_loader, model, criterion):
     model.eval()
 
     with torch.no_grad():
-        pbar = tqdm(total=len(val_loader))
+        pbar = tqdm(total=len(val_loader), desc="Validating", unit="batch")
         for img, mask, _ in val_loader:
             inputs = img.cuda()
             targets = mask.cuda()
@@ -124,27 +126,31 @@ def validate(config, val_loader, model, criterion):
             if config['deep_supervision']:
                 outputs = model(inputs)
                 loss = sum(criterion(o, targets) for o in outputs) / len(outputs)
-                iou, dice = iou_score(outputs[-1], targets), dice_score(outputs[-1], targets)
+                iou = iou_score(outputs[-1], targets)
+                dice = dice_score(outputs[-1], targets)
             else:
                 output = model(inputs)
                 loss = criterion(output, targets)
-                iou, dice = iou_score(output, targets), dice_score(output, targets)
+                iou = iou_score(output, targets)
+                dice = dice_score(output, targets)
 
             avg_meters['loss'].update(loss.item(), inputs.size(0))
             avg_meters['iou'].update(iou, inputs.size(0))
             avg_meters['dice'].update(dice, inputs.size(0))
             
-            pbar.set_postfix(OrderedDict([
-                ('loss', avg_meters['loss'].avg),
-                ('iou', avg_meters['iou'].avg),
-                ('dice', avg_meters['dice'].avg)
-            ]))
+            # Update progress bar with only relevant metrics
+            pbar.set_postfix({
+                'Loss': f"{avg_meters['loss'].avg:.4f}",
+                'IoU': f"{avg_meters['iou'].avg:.4f}",
+                'Dice': f"{avg_meters['dice'].avg:.4f}"
+            })
             pbar.update(1)
         pbar.close()
         
     return OrderedDict([('loss', avg_meters['loss'].avg),
-                       ('iou', avg_meters['iou'].avg),
-                       ('dice', avg_meters['dice'].avg)])
+                        ('iou', avg_meters['iou'].avg),
+                        ('dice', avg_meters['dice'].avg)])
+
 
 def seed_torch(seed=1029):
     random.seed(seed)
