@@ -38,6 +38,12 @@ def parse_args():
     parser.add_argument('-b', '--batch_size', default=4, type=int)
     parser.add_argument('--dataseed', default=2981, type=int)
     
+    parser.add_argument('--use_advanced_aug', type=str2bool, default=False)
+    parser.add_argument('--aug_prob', type=float, default=0.5)
+    parser.add_argument('--mixup_alpha', type=float, default=1.0)
+    parser.add_argument('--cutmix_alpha', type=float, default=1.0)
+
+    
     # Model parameters
     parser.add_argument('--arch', default='UKAN')
     parser.add_argument('--deep_supervision', default=False, type=str2bool)
@@ -74,7 +80,53 @@ def parse_args():
     
     return parser.parse_args()
 
+def rand_bbox(size, lam):
+    W, H = size[2], size[3]
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = np.int32(W * cut_rat)
+    cut_h = np.int32(H * cut_rat)
+
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+
+    return bbx1, bby1, bbx2, bby2
+
+def mixup_data(x, y, alpha=1.0):
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x.size()[0]
+    index = torch.randperm(batch_size).cuda()
+
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    mixed_y = lam * y + (1 - lam) * y[index, :]
+    return mixed_x, mixed_y, lam
+
 def train(config, train_loader, model, criterion, optimizer):
+    def rand_bbox(size, lam):
+        """Generate random bounding box for CutMix"""
+        W, H = size[2], size[3]
+        cut_rat = np.sqrt(1. - lam)
+        cut_w = int(W * cut_rat)
+        cut_h = int(H * cut_rat)
+
+        cx = np.random.randint(W)
+        cy = np.random.randint(H)
+
+        bbx1 = np.clip(cx - cut_w//2, 0, W)
+        bby1 = np.clip(cy - cut_h//2, 0, H)
+        bbx2 = np.clip(cx + cut_w//2, 0, W)
+        bby2 = np.clip(cy + cut_h//2, 0, H)
+
+        return bbx1, bby1, bbx2, bby2
+
     avg_meters = {'loss': AverageMeter(), 'iou': AverageMeter()}
     model.train()
 
@@ -83,6 +135,27 @@ def train(config, train_loader, model, criterion, optimizer):
         inputs = img.cuda()
         targets = mask.cuda()
 
+        # Apply advanced augmentations conditionally
+        if config.get('use_advanced_aug', False):
+            if np.random.rand() < config.get('aug_prob', 0.5):
+                # Choose between MixUp and CutMix
+                if np.random.rand() < 0.5:
+                    # MixUp augmentation
+                    lam = np.random.beta(config['mixup_alpha'], config['mixup_alpha'])
+                    index = torch.randperm(inputs.size(0), device=inputs.device)
+                    mixed_inputs = lam * inputs + (1 - lam) * inputs[index]
+                    mixed_targets = targets[index]
+                    inputs, targets = mixed_inputs, mixed_targets
+                else:
+                    # CutMix augmentation
+                    lam = np.random.beta(config['cutmix_alpha'], config['cutmix_alpha'])
+                    index = torch.randperm(inputs.size(0), device=inputs.device)
+                    bbx1, bby1, bbx2, bby2 = rand_bbox(inputs.size(), lam)
+                    # Apply CutMix to both image and mask
+                    inputs[:, :, bbx1:bbx2, bby1:bby2] = inputs[index, :, bbx1:bbx2, bby1:bby2]
+                    targets[:, bbx1:bbx2, bby1:bby2] = targets[index, bbx1:bbx2, bby1:bby2]
+
+        # Forward pass
         if config['deep_supervision']:
             outputs = model(inputs)
             loss = sum(criterion(o, targets) for o in outputs) / len(outputs)
@@ -92,22 +165,28 @@ def train(config, train_loader, model, criterion, optimizer):
             loss = criterion(output, targets)
             iou = iou_score(output, targets)
 
+        # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
+        # Update metrics
         avg_meters['loss'].update(loss.item(), inputs.size(0))
         avg_meters['iou'].update(iou, inputs.size(0))
         
+        # Update progress bar
         pbar.set_postfix(OrderedDict([
             ('loss', avg_meters['loss'].avg),
             ('iou', avg_meters['iou'].avg),
         ]))
         pbar.update(1)
-    pbar.close()
     
-    return OrderedDict([('loss', avg_meters['loss'].avg),
-                        ('iou', avg_meters['iou'].avg)])
+    pbar.close()
+    return OrderedDict([
+        ('loss', avg_meters['loss'].avg),
+        ('iou', avg_meters['iou'].avg)
+    ])
+
 
 def validate(config, val_loader, model, criterion):
     avg_meters = {'loss': AverageMeter(), 
@@ -120,6 +199,7 @@ def validate(config, val_loader, model, criterion):
         for img, mask, _ in val_loader:
             inputs = img.cuda()
             targets = mask.cuda()
+            targets = targets.long()
 
             if config['deep_supervision']:
                 outputs = model(inputs)
