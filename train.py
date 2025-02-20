@@ -438,7 +438,9 @@ def main():
 
     # Final evaluation on test set
     print("\nEvaluating on test set...")
-    model.load_state_dict(torch.load(os.path.join(exp_dir, 'model.pth')))
+    print("Testing on best model")
+    modelHigh = config['epochs']
+    model.load_state_dict(torch.load(os.path.join(exp_dir, 'model_best.pth')))
     
     class_names = [
         'road', 'sidewalk', 'building', 'wall', 'fence',
