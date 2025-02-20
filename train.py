@@ -52,6 +52,8 @@ def parse_args():
     parser.add_argument('--input_w', default=256, type=int)
     parser.add_argument('--input_h', default=256, type=int)
     parser.add_argument('--input_list', type=list_type, default=[512, 640, 1024])
+    parser.add_argument('--save_interval', type=int, default=1, 
+                      help='Epoch interval for saving checkpoints')
     
     # Dataset
     parser.add_argument('--dataset', default='cityscapes', help='dataset name')  
@@ -405,11 +407,18 @@ def main():
         log['val_iou'].append(val_log['iou'])
         log['val_dice'].append(val_log['dice'])
         
-        # Save checkpoints
+        if (epoch + 1) % config['save_interval'] == 0:
+            ckpt_path = os.path.join(exp_dir, f'model_epoch_{epoch+1}.pth')
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"Saved interval checkpoint at epoch {epoch+1}")
+    
+        # Save best model
         if val_log['iou'] > best_iou:
-            torch.save(model.state_dict(), os.path.join(exp_dir, 'model.pth'))
+            best_path = os.path.join(exp_dir, 'model_best.pth')
+            torch.save(model.state_dict(), best_path)
             best_iou = val_log['iou']
-            print(f"Saved best model (IoU: {best_iou:.4f})")
+            print(f"New best model (IoU: {best_iou:.4f})")
+
         
         # Tensorboard logging
         writer.add_scalars('loss', {
