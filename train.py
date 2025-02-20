@@ -18,8 +18,8 @@ from torch.optim import lr_scheduler
 from tqdm import tqdm
 import archs
 import losses
-from dataset import CityscapesDataset  # Changed to custom dataset class
-from metrics import iou_score, dice_score  # Now matches the corrected metrics.py
+from dataset import CityscapesDataset
+from metrics import calculate_metrics, print_metrics, iou_score, dice_score
 from utils import AverageMeter, str2bool
 from tensorboardX import SummaryWriter
 import shutil
@@ -35,7 +35,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', default=None, help='model name')
     parser.add_argument('--epochs', default=400, type=int)
-    parser.add_argument('-b', '--batch_size', default=4, type=int)  # Increased default
+    parser.add_argument('-b', '--batch_size', default=4, type=int)
     parser.add_argument('--dataseed', default=2981, type=int)
     
     # Model parameters
@@ -69,7 +69,7 @@ def parse_args():
     parser.add_argument('--milestones', default='1,2', type=str)
     parser.add_argument('--gamma', default=2/3, type=float)
     parser.add_argument('--early_stopping', default=-1, type=int)
-    parser.add_argument('--num_workers', default=2, type=int)  # Reduced for stability
+    parser.add_argument('--num_workers', default=2, type=int)
     parser.add_argument('--no_kan', action='store_true')
     
     return parser.parse_args()
@@ -78,7 +78,7 @@ def train(config, train_loader, model, criterion, optimizer):
     avg_meters = {'loss': AverageMeter(), 'iou': AverageMeter()}
     model.train()
 
-    pbar = tqdm(total=len(train_loader), desc="Training", unit="batch")
+    pbar = tqdm(total=len(train_loader), desc="Training")
     for img, mask, _ in train_loader:
         inputs = img.cuda()
         targets = mask.cuda()
@@ -99,17 +99,15 @@ def train(config, train_loader, model, criterion, optimizer):
         avg_meters['loss'].update(loss.item(), inputs.size(0))
         avg_meters['iou'].update(iou, inputs.size(0))
         
-        # Update progress bar with only relevant metrics
-        pbar.set_postfix({
-            'Loss': f"{avg_meters['loss'].avg:.4f}",
-            'IoU': f"{avg_meters['iou'].avg:.4f}"
-        })
+        pbar.set_postfix(OrderedDict([
+            ('loss', avg_meters['loss'].avg),
+            ('iou', avg_meters['iou'].avg),
+        ]))
         pbar.update(1)
     pbar.close()
     
     return OrderedDict([('loss', avg_meters['loss'].avg),
                         ('iou', avg_meters['iou'].avg)])
-
 
 def validate(config, val_loader, model, criterion):
     avg_meters = {'loss': AverageMeter(), 
@@ -118,7 +116,7 @@ def validate(config, val_loader, model, criterion):
     model.eval()
 
     with torch.no_grad():
-        pbar = tqdm(total=len(val_loader), desc="Validating", unit="batch")
+        pbar = tqdm(total=len(val_loader), desc="Validation")
         for img, mask, _ in val_loader:
             inputs = img.cuda()
             targets = mask.cuda()
@@ -127,30 +125,65 @@ def validate(config, val_loader, model, criterion):
                 outputs = model(inputs)
                 loss = sum(criterion(o, targets) for o in outputs) / len(outputs)
                 iou = iou_score(outputs[-1], targets)
-                dice = dice_score(outputs[-1], targets)
+                dice = dice_score(outputs[-1], targets).item()  # Convert to float
             else:
                 output = model(inputs)
                 loss = criterion(output, targets)
                 iou = iou_score(output, targets)
-                dice = dice_score(output, targets)
+                dice = dice_score(output, targets).item()
 
             avg_meters['loss'].update(loss.item(), inputs.size(0))
             avg_meters['iou'].update(iou, inputs.size(0))
-            avg_meters['dice'].update(dice, inputs.size(0))
+            avg_meters['dice'].update(dice.item() if torch.is_tensor(dice) else dice, inputs.size(0))
             
-            # Update progress bar with only relevant metrics
-            pbar.set_postfix({
-                'Loss': f"{avg_meters['loss'].avg:.4f}",
-                'IoU': f"{avg_meters['iou'].avg:.4f}",
-                'Dice': f"{avg_meters['dice'].avg:.4f}"
-            })
+            pbar.set_postfix(OrderedDict([
+                ('loss', avg_meters['loss'].avg),
+                ('iou', avg_meters['iou'].avg),
+                ('dice', avg_meters['dice'].avg)
+            ]))
             pbar.update(1)
         pbar.close()
-        
-    return OrderedDict([('loss', avg_meters['loss'].avg),
-                        ('iou', avg_meters['iou'].avg),
-                        ('dice', avg_meters['dice'].avg)])
+    # Change return statement in validate():
+    return OrderedDict([
+        ('loss', avg_meters['loss'].avg),
+        ('iou', avg_meters['iou'].avg),
+        ('dice', avg_meters['dice'].avg)
+    ])
 
+def evaluate_test(model, test_loader, num_classes):
+    model.eval()
+    metrics = {
+        'iou': torch.zeros(num_classes).cuda(),
+        'pixel_acc': 0.0,
+        'mean_acc': 0.0,
+        'count': 0
+    }
+    
+    with torch.no_grad():
+        pbar = tqdm(total=len(test_loader), desc="Testing")
+        for img, mask, _ in test_loader:
+            inputs = img.cuda()
+            targets = mask.cuda()
+            
+            outputs = model(inputs)
+            batch_metrics = calculate_metrics(outputs, targets, num_classes)
+            
+            # Convert numpy array to CUDA tensor before accumulation
+            batch_iou = torch.from_numpy(batch_metrics['class_iou']).cuda()
+            metrics['iou'] += batch_iou
+            
+            metrics['pixel_acc'] += batch_metrics['pixel_accuracy'] * inputs.size(0)
+            metrics['mean_acc'] += batch_metrics['mean_accuracy'] * inputs.size(0)
+            metrics['count'] += inputs.size(0)
+            pbar.update(1)
+        pbar.close()
+    
+    return {
+        'class_iou': (metrics['iou'] / metrics['count']).cpu().numpy(),
+        'mean_iou': (metrics['iou'].sum() / (metrics['count'] * num_classes)).item(),
+        'pixel_accuracy': metrics['pixel_acc'] / metrics['count'],
+        'mean_accuracy': metrics['mean_acc'] / metrics['count']
+    }
 
 def seed_torch(seed=1029):
     random.seed(seed)
@@ -211,32 +244,35 @@ def main():
     else:
         scheduler = None
 
-    # Data loading
-    train_img_dir = os.path.join(config['data_dir'], 'train', 'images')
-    train_mask_dir = os.path.join(config['data_dir'], 'train', 'masks')
-    val_img_dir = os.path.join(config['data_dir'], 'val', 'images')
-    val_mask_dir = os.path.join(config['data_dir'], 'val', 'masks')
-
-    train_img_ids = [f.replace('.npy','') for f in os.listdir(train_img_dir)]
-    val_img_ids = [f.replace('.npy','') for f in os.listdir(val_img_dir)]
-
-    # Initialize datasets with proper transforms
+    # Create dataset splits
+    train_ids, test_ids = CityscapesDataset.create_splits(config['data_dir'])
+    
+    # Initialize datasets
     train_dataset = CityscapesDataset(
-        img_ids=train_img_ids,
-        img_dir=train_img_dir,
-        mask_dir=train_mask_dir,
+        img_ids=train_ids,
+        img_dir=os.path.join(config['data_dir'], 'train', 'images'),
+        mask_dir=os.path.join(config['data_dir'], 'train', 'masks'),
         num_classes=config['num_classes'],
         transform=CityscapesDataset.get_train_transforms(config['input_h'])
     )
 
     val_dataset = CityscapesDataset(
-        img_ids=val_img_ids,
-        img_dir=val_img_dir,
-        mask_dir=val_mask_dir,
+        img_ids=[f.replace('.npy','') for f in os.listdir(os.path.join(config['data_dir'], 'val', 'images'))],
+        img_dir=os.path.join(config['data_dir'], 'val', 'images'),
+        mask_dir=os.path.join(config['data_dir'], 'val', 'masks'),
         num_classes=config['num_classes'],
         transform=CityscapesDataset.get_val_transforms(config['input_h'])
     )
 
+    test_dataset = CityscapesDataset(
+        img_ids=test_ids,
+        img_dir=os.path.join(config['data_dir'], 'train', 'images'),
+        mask_dir=os.path.join(config['data_dir'], 'train', 'masks'),
+        num_classes=config['num_classes'],
+        transform=CityscapesDataset.get_val_transforms(config['input_h'])
+    )
+
+    # Data loaders
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=config['batch_size'],
@@ -253,6 +289,14 @@ def main():
         num_workers=config['num_workers'],
         pin_memory=True,
         drop_last=False
+    )
+
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=config['num_workers'],
+        pin_memory=True
     )
 
     # Training loop
@@ -302,6 +346,20 @@ def main():
         
     writer.close()
     print("Training completed!")
+
+    # Final evaluation on test set
+    print("\nEvaluating on test set...")
+    model.load_state_dict(torch.load(os.path.join(exp_dir, 'model.pth')))
+    
+    class_names = [
+        'road', 'sidewalk', 'building', 'wall', 'fence',
+        'pole', 'traffic light', 'traffic sign', 'vegetation', 'terrain',
+        'sky', 'person', 'rider', 'car', 'truck',
+        'bus', 'train', 'motorcycle', 'bicycle'
+    ]
+    
+    test_metrics = evaluate_test(model, test_loader, config['num_classes'])
+    print_metrics(test_metrics, class_names)
 
 if __name__ == '__main__':
     main()

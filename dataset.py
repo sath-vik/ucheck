@@ -7,6 +7,7 @@ from albumentations import (
     HueSaturationValue, RandomResizedCrop, RGBShift, RandomBrightnessContrast
 )
 import cv2
+from sklearn.model_selection import train_test_split
 
 class CityscapesDataset(torch.utils.data.Dataset):
     def __init__(self, img_ids, img_dir, mask_dir, 
@@ -44,7 +45,7 @@ class CityscapesDataset(torch.utils.data.Dataset):
             mask = mask.astype(np.uint8)
 
         # Handle class labels before validation
-        mask = np.clip(mask, 0, self.num_classes-1)  # CLIP BEFORE VALIDATION
+        mask = np.clip(mask, 0, self.num_classes-1)
 
         # Validate raw data
         assert img.shape[:2] == mask.shape, \
@@ -89,6 +90,17 @@ class CityscapesDataset(torch.utils.data.Dataset):
         ])
 
     @staticmethod
+    def create_splits(base_path="inputs", test_size=0.2, random_state=42):
+        train_img_dir = os.path.join(base_path, "train", "images")
+        all_ids = [f.replace('.npy', '') for f in os.listdir(train_img_dir)]
+        train_ids, test_ids = train_test_split(
+            all_ids, 
+            test_size=test_size,
+            random_state=random_state
+        )
+        return train_ids, test_ids
+
+    @staticmethod
     def verify_dataset_structure(base_path="inputs"):
         for split in ['train', 'val']:
             split_path = os.path.join(base_path, split)
@@ -108,8 +120,13 @@ class CityscapesDataset(torch.utils.data.Dataset):
 if __name__ == '__main__':
     CityscapesDataset.verify_dataset_structure()
     
+    # Example usage
+    train_ids, test_ids = CityscapesDataset.create_splits()
+    print(f"\nDataset splits created - Train: {len(train_ids)}, Test: {len(test_ids)}")
+    
+    # Sample dataset instance
     train_dataset = CityscapesDataset(
-        img_ids=[f.replace('.npy', '') for f in os.listdir("inputs/train/images")],
+        img_ids=train_ids,
         img_dir="inputs/train/images",
         mask_dir="inputs/train/masks",
         transform=CityscapesDataset.get_train_transforms(256),
